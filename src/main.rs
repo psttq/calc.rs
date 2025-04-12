@@ -1,10 +1,12 @@
+use clap::Parser;
 use nom::{
     IResult,
     branch::alt,
+    bytes::complete::tag,
     character::complete::{char, digit1, space0},
     combinator::{cut, map, map_res, opt, recognize},
     error::{Error, context},
-    sequence::{delimited, preceded, separated_pair, tuple},
+    sequence::{delimited, pair, preceded, separated_pair, tuple},
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -15,6 +17,28 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    Constant(ConstantType),
+    Function {
+        ftype: FunctionType,
+        expr: Box<Expr>,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum FunctionType {
+    SQRT,
+    SIN,
+    COS,
+    TG,
+    CTG,
+    LN,
+    EXP,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ConstantType {
+    PI,
+    E,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -24,6 +48,38 @@ pub enum BinaryOpType {
     Mul,
     Div,
     Pow,
+}
+
+fn parse_constant(input: &str) -> IResult<&str, Expr> {
+    map(
+        alt((
+            map(tag("pi"), |_| ConstantType::PI),
+            map(tag("e"), |_| ConstantType::E),
+        )),
+        |constant: ConstantType| Expr::Constant(constant),
+    )(input)
+}
+
+fn parse_function_type(input: &str) -> IResult<&str, FunctionType> {
+    alt((
+        map(tag("sqrt"), |_| FunctionType::SQRT),
+        map(tag("cos"), |_| FunctionType::COS),
+        map(tag("sin"), |_| FunctionType::SIN),
+        map(tag("tg"), |_| FunctionType::TG),
+        map(tag("ctg"), |_| FunctionType::CTG),
+        map(tag("ln"), |_| FunctionType::LN),
+        map(tag("exp"), |_| FunctionType::EXP),
+    ))(input)
+}
+
+fn parse_function(input: &str) -> IResult<&str, Expr> {
+    map(
+        preceded(space0, pair(parse_function_type, parse_parenthesized)),
+        |res| Expr::Function {
+            ftype: res.0,
+            expr: Box::new(res.1),
+        },
+    )(input)
 }
 
 fn parse_simple_number(input: &str) -> IResult<&str, Expr> {
@@ -69,10 +125,12 @@ fn parse_term(input: &str) -> IResult<&str, Expr> {
     context(
         "term",
         alt((
+            parse_function,
             parse_parenthesized,
             parse_scientific_notation,
             parse_float_number,
             parse_simple_number,
+            parse_constant,
         )),
     )(input)
 }
@@ -207,12 +265,32 @@ pub fn check_on_inf(input: f64) -> Result<f64, String> {
     }
 }
 
-pub fn eval(expr: &Expr) -> Result<f64, String> {
+pub fn eval(expr: &Expr, use_degrees: bool) -> Result<f64, String> {
     match expr {
         Expr::Number(val) => Ok(*val),
+        Expr::Constant(constant) => match constant {
+            ConstantType::PI => Ok(std::f64::consts::PI),
+            ConstantType::E => Ok(std::f64::consts::E),
+        },
+        Expr::Function { ftype, expr } => {
+            let res = eval(expr, use_degrees)?;
+            let mut angle_res = res;
+            if use_degrees {
+                angle_res = f64::to_radians(res);
+            }
+            match ftype {
+                FunctionType::TG => check_on_inf(f64::tan(angle_res)),
+                FunctionType::CTG => check_on_inf(1.0 / f64::tan(angle_res)),
+                FunctionType::COS => check_on_inf(f64::cos(angle_res)),
+                FunctionType::SIN => check_on_inf(f64::sin(angle_res)),
+                FunctionType::EXP => check_on_inf(f64::exp(res)),
+                FunctionType::LN => check_on_inf(f64::ln(res)),
+                FunctionType::SQRT => check_on_inf(f64::sqrt(res)),
+            }
+        }
         Expr::BinaryOp { op, left, right } => {
-            let left_val = eval(left)?;
-            let right_val = eval(right)?;
+            let left_val = eval(left, use_degrees)?;
+            let right_val = eval(right, use_degrees)?;
             match op {
                 BinaryOpType::Add => check_on_inf(left_val + right_val),
                 BinaryOpType::Sub => check_on_inf(left_val - right_val),
@@ -230,20 +308,33 @@ pub fn eval(expr: &Expr) -> Result<f64, String> {
     }
 }
 
-fn main() {
-    let inputs = ["2*2^3"];
-
-    for input in inputs {
-        println!("Input: '{}'", input);
-        match parse(input) {
-            Ok(expr) => match eval(&expr) {
-                Ok(result) => println!("Result: {}", result),
-                Err(e) => println!("Evaluation error: {}", e),
-            },
-            Err(e) => println!("Parse error: {}", e),
-        }
-        println!();
+fn parse_eval(input: &str, use_degrees: bool) {
+    match parse(input) {
+        Ok(expr) => match eval(&expr, use_degrees) {
+            Ok(result) => println!("Result: {}", result),
+            Err(e) => println!("Evaluation error: {}", e),
+        },
+        Err(e) => println!("Parse error: {}", e),
     }
+}
+
+#[derive(Parser, Debug)]
+struct Cli {
+    expr: String,
+    #[arg(default_value = "radians", long)]
+    angle_unit: String,
+}
+fn main() {
+    let args = Cli::parse();
+    let use_degrees: bool = match args.angle_unit.as_str() {
+        "radians" => false,
+        "degrees" => true,
+        _ => {
+            println!("Error: Unknown angle unit");
+            return;
+        }
+    };
+    parse_eval(args.expr.as_str(), use_degrees);
 }
 
 #[cfg(test)]
@@ -266,15 +357,90 @@ mod parser_tests {
     }
 
     #[test]
-    fn parse_scientific_notation_test() {
-        let result = parse_scientific_notation("1.2e10");
-        assert_eq!(result, Ok(("", Expr::Number(1.2e10))));
+    fn parse_function_test() {
+        let result = parse_function("sin(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::SIN,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
 
-        let result = parse_scientific_notation("1.2e-10");
-        assert_eq!(result, Ok(("", Expr::Number(1.2e-10))));
+        let result = parse_function("cos(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::COS,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
 
-        let result = parse_scientific_notation("2e-10");
-        assert_eq!(result, Ok(("", Expr::Number(2e-10))));
+        let result = parse_function("tg(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::TG,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
+
+        let result = parse_function("ctg(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::CTG,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
+
+        let result = parse_function("exp(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::EXP,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
+
+        let result = parse_function("ln(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::LN,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
+
+        let result = parse_function("sqrt(4)");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::Function {
+                    ftype: FunctionType::SQRT,
+                    expr: Box::new(Expr::Number(4.0))
+                }
+            ))
+        );
     }
 
     #[test]
@@ -484,53 +650,134 @@ mod parser_tests {
 
     #[test]
     fn evaluator_test() {
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Add,
-            left: Box::new(Expr::Number(1.0)),
-            right: Box::new(Expr::Number(2.0)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Add,
+                left: Box::new(Expr::Number(1.0)),
+                right: Box::new(Expr::Number(2.0)),
+            },
+            false,
+        );
         assert_eq!(result, Ok(3.0));
 
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Mul,
-            left: Box::new(Expr::Number(3.0)),
-            right: Box::new(Expr::Number(4.0)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Mul,
+                left: Box::new(Expr::Number(3.0)),
+                right: Box::new(Expr::Number(4.0)),
+            },
+            false,
+        );
         assert_eq!(result, Ok(12.0));
 
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Sub,
-            left: Box::new(Expr::Number(3.0)),
-            right: Box::new(Expr::Number(4.0)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Sub,
+                left: Box::new(Expr::Number(3.0)),
+                right: Box::new(Expr::Number(4.0)),
+            },
+            false,
+        );
         assert_eq!(result, Ok(-1.0));
 
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Div,
-            left: Box::new(Expr::Number(3.0)),
-            right: Box::new(Expr::Number(4.0)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Div,
+                left: Box::new(Expr::Number(3.0)),
+                right: Box::new(Expr::Number(4.0)),
+            },
+            false,
+        );
         assert_eq!(result, Ok(3.0 / 4.0));
 
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Div,
-            left: Box::new(Expr::Number(3.0)),
-            right: Box::new(Expr::Number(0.0)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Div,
+                left: Box::new(Expr::Number(3.0)),
+                right: Box::new(Expr::Number(0.0)),
+            },
+            false,
+        );
         assert_eq!(result, Err("Division by zero".to_string()));
 
-        let result = eval(&Expr::BinaryOp {
-            op: BinaryOpType::Div,
-            left: Box::new(Expr::Number(1e300)),
-            right: Box::new(Expr::Number(1e-300)),
-        });
+        let result = eval(
+            &Expr::BinaryOp {
+                op: BinaryOpType::Div,
+                left: Box::new(Expr::Number(1e300)),
+                right: Box::new(Expr::Number(1e-300)),
+            },
+            false,
+        );
         assert_eq!(result, Err("Value overflow".to_string()));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::SQRT,
+                expr: Box::new(Expr::Number(4.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(2.0));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::SIN,
+                expr: Box::new(Expr::Number(90.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(1.0));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::COS,
+                expr: Box::new(Expr::Number(0.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(1.0));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::TG,
+                expr: Box::new(Expr::Number(0.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(0.0));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::CTG,
+                expr: Box::new(Expr::Number(45.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(1.0 / f64::tan(f64::to_radians(45.0))));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::EXP,
+                expr: Box::new(Expr::Number(2.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(f64::exp(2.0)));
+
+        let result = eval(
+            &Expr::Function {
+                ftype: FunctionType::LN,
+                expr: Box::new(Expr::Number(2.0)),
+            },
+            true,
+        );
+        assert_eq!(result, Ok(f64::ln(2.0)));
     }
     #[test]
     fn parse_eval_test() {
         fn make_test(input: &str) -> Result<f64, String> {
             match parse(input) {
-                Ok(expr) => match eval(&expr) {
+                Ok(expr) => match eval(&expr, false) {
                     Ok(result) => Ok(result),
                     Err(e) => Err(format!("Evaluation error: {}", e)),
                 },
@@ -551,5 +798,46 @@ mod parser_tests {
             result,
             Err("Evaluation error: Division by zero".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use std::time::Instant;
+
+    const MAX_TIME_MS: u128 = 200u128;
+
+    use super::*;
+
+    fn load_test<F>(f: F, input: &str, use_degrees: bool) -> bool
+    where
+        F: Fn(&str, bool) -> (),
+    {
+        let start = Instant::now();
+        f(input, use_degrees);
+        let duration = start.elapsed();
+
+        return duration.as_millis() < MAX_TIME_MS;
+    }
+
+    #[test]
+    fn load_test1() {
+        let input = "1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+
+          1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1";
+
+        assert_eq!(load_test(parse_eval, input, false), true);
     }
 }
