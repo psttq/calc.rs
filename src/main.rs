@@ -23,6 +23,7 @@ pub enum BinaryOpType {
     Sub,
     Mul,
     Div,
+    Pow,
 }
 
 fn parse_simple_number(input: &str) -> IResult<&str, Expr> {
@@ -96,12 +97,41 @@ fn parse_mul_div_op(input: &str) -> IResult<&str, BinaryOpType> {
     )(input)
 }
 
-fn parse_mul_div(input: &str) -> IResult<&str, Expr> {
+fn parse_power(input: &str) -> IResult<&str, Expr> {
     let (mut input, mut left) = parse_term(input)?;
 
     loop {
+        match preceded(space0, char('^'))(input) {
+            Ok((input_after_op, _)) => match preceded(space0, parse_term)(input_after_op) {
+                Ok((input_after_right, right)) => {
+                    left = Expr::BinaryOp {
+                        op: BinaryOpType::Pow,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    };
+                    input = input_after_right;
+                }
+                Err(_e) => {
+                    return Err(nom::Err::Error(Error::new(
+                        input_after_op,
+                        nom::error::ErrorKind::MapRes,
+                    )));
+                }
+            },
+            Err(nom::Err::Error(_)) | Err(nom::Err::Failure(_)) => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok((input, left))
+}
+
+fn parse_mul_div(input: &str) -> IResult<&str, Expr> {
+    let (mut input, mut left) = parse_power(input)?;
+
+    loop {
         match preceded(space0, parse_mul_div_op)(input) {
-            Ok((input_after_op, op)) => match preceded(space0, parse_term)(input_after_op) {
+            Ok((input_after_op, op)) => match preceded(space0, parse_power)(input_after_op) {
                 Ok((input_after_right, right)) => {
                     left = Expr::BinaryOp {
                         op,
@@ -194,13 +224,14 @@ pub fn eval(expr: &Expr) -> Result<f64, String> {
                         check_on_inf(left_val / right_val)
                     }
                 }
+                BinaryOpType::Pow => check_on_inf(left_val.powf(right_val)),
             }
         }
     }
 }
 
 fn main() {
-    let inputs = ["1.4 + 1e-2", "1+(2+2*2)*2", "1/3 + 2"];
+    let inputs = ["2*2^3"];
 
     for input in inputs {
         println!("Input: '{}'", input);
@@ -285,6 +316,22 @@ mod parser_tests {
                     op: BinaryOpType::Div,
                     left: Box::new(Expr::Number(2.0)),
                     right: Box::new(Expr::Number(3.0))
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_power_test() {
+        let result = parse_power("3^4");
+        assert_eq!(
+            result,
+            Ok((
+                "",
+                Expr::BinaryOp {
+                    op: BinaryOpType::Pow,
+                    left: Box::new(Expr::Number(3.0)),
+                    right: Box::new(Expr::Number(4.0))
                 }
             ))
         );
@@ -433,12 +480,6 @@ mod parser_tests {
 
         let result = parse("1/a");
         assert_eq!(result, Err("Syntax error at 'a'".to_string()));
-
-        let result = parse("2^3");
-        assert_eq!(
-            result,
-            Err("Unexpected trailing characters: '^3'".to_string())
-        );
     }
 
     #[test]
@@ -484,5 +525,31 @@ mod parser_tests {
             right: Box::new(Expr::Number(1e-300)),
         });
         assert_eq!(result, Err("Value overflow".to_string()));
+    }
+    #[test]
+    fn parse_eval_test() {
+        fn make_test(input: &str) -> Result<f64, String> {
+            match parse(input) {
+                Ok(expr) => match eval(&expr) {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(format!("Evaluation error: {}", e)),
+                },
+                Err(e) => Err(format!("Parse error: {}", e)),
+            }
+        }
+        let result = make_test("1+2/3");
+        assert_eq!(result, Ok(1.0 + 2.0 / 3.0));
+
+        let result = make_test("1+2^(1+2)");
+        assert_eq!(result, Ok(9.0));
+
+        let result = make_test("1/");
+        assert_eq!(result, Err("Parse error: Syntax error at ''".to_string()));
+
+        let result = make_test("3/0");
+        assert_eq!(
+            result,
+            Err("Evaluation error: Division by zero".to_string())
+        );
     }
 }
